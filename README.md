@@ -1,4 +1,3 @@
-````markdown
 # EchoKey v10 — Open Loop Consciousness and Meta-Evolution
 
 **EchoKey v10** is the tenth branch of the EchoKey framework:  
@@ -34,6 +33,3 @@ All work here is released **under CC0**, so anyone can build on it.
 
 This project and all accompanying documents are dedicated to the **public domain (CC0 1.0)**.
 You are free to use, modify, and build upon it without restriction.
-
-```
-
