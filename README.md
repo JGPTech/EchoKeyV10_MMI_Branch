@@ -8,7 +8,6 @@ Where earlier versions modeled resonance, memory, and convergence, v10 integrate
 This repository contains:  
 - 📄 **Paper:** *EchoKey v10: Open Loop Consciousness and Meta-Evolution* (CC0)  
 - 🐍 **Code:** A Python toy model that simulates the system dynamics.
-- https://doi.org/10.5281/zenodo.16939214
 
 ---
 
@@ -27,6 +26,7 @@ All work here is released **under CC0**, so anyone can build on it.
 
 * EchoKey Team. *EchoKey v10: Open Loop Consciousness and Meta-Evolution.* 2025.
 * Consolidated in *The EchoKey Framework v1–v10* (2025) .
+* https://doi.org/10.5281/zenodo.16939214
 
 ---
 
@@ -34,5 +34,6 @@ All work here is released **under CC0**, so anyone can build on it.
 
 This project and all accompanying documents are dedicated to the **public domain (CC0 1.0)**.
 You are free to use, modify, and build upon it without restriction.
+
 
 
