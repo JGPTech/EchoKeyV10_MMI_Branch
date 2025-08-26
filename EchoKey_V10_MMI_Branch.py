@@ -1221,176 +1221,363 @@ def shannon_entropy_matrix(M: np.ndarray):
     return -np.sum(probs[probs>0] * np.log(probs[probs>0] + 1e-20))
 
 def echokey_main_loop_skeleton(max_iter=30, use_non_potential_op=False, use_trust_region=False):
+    """
+    EchoKey Main Loop Skeleton (v10.5, MMI-aligned)
+    - Operator model: T(x) = BaseOp( Pipeline(x) ), where Pipeline follows
+      CANONICAL_COGNITIVE_PIPELINE_ORDER. Certificates are composed sequentially.
+    - IQC guard is a hard gate when Pi is present.
+    - Deterministic RNG and JSONL logging via EKLogger.
+    """
     print("\n--- Running EchoKey Main Loop Skeleton (Full Feature Demo) ---")
-    if use_non_potential_op: print("--- Using NON-POTENTIAL operator (T != grad J) ---")
-    if use_trust_region: print("--- Using TRUST-REGION controller ---")
-    rng = RNGManager(seed0=42); DIM=4; DTYPE=np.complex128
-    A = np.array([[1.5,0.5j,0,0],[-0.5j,1.2,0,0],[0,0,1,0],[0,0,0,1]], dtype=DTYPE)
-    b = np.array([1.0,-0.5,0,0], dtype=DTYPE); x_star = np.linalg.solve(A, b)
-    base_op_fn_raw = (lambda v: np.array([[0,-1,0,0],[1,0,0,0],[0,0,0,-1],[0,0,1,0]]) @ (A@v-b)) if use_non_potential_op else (lambda v: A@v-b)
-    base_op_fn = lambda v: (base_op_fn_raw(v), {'oracle_calls': 1}); base_cert = CertRec("BaseOp", L=np.linalg.norm(A, 2))
-    base_cert.theta_kl = 0.5 # Add KL contract for testing
-    problem_J = lambda v: 0.5 * np.linalg.norm(v - x_star)**2; grad_J = lambda v: v - x_star; hess_J = np.eye(DIM, dtype=DTYPE)
-    
-    psi = rng.get_stream().standard_normal(DIM, dtype=np.float64) + 1j * rng.get_stream().standard_normal(DIM, dtype=np.float64)
-    system_state = {'psi': psi / np.linalg.norm(psi), 'Q': np.eye(DIM, dtype=DTYPE)*0.1, 'E': np.zeros((DIM,DIM), dtype=DTYPE), 'M': np.zeros((DIM,DIM), dtype=DTYPE)}
-    D_diss, param_adapter = 0.01, {'Q_coupling': ProbabilisticParameter('Q_coupling'), 'E_coupling': ProbabilisticParameter('E_coupling')}
+    if use_non_potential_op:
+        print("--- Using NON-POTENTIAL operator (T != grad J) ---")
+    if use_trust_region:
+        print("--- Using TRUST-REGION controller ---")
 
-    logger = EKLogger(); modules = build_placeholder_modules(rng, base_op_fn, base_cert, DIM, DTYPE); module_map = {m.name: m for m in modules}
+    rng = RNGManager(seed0=42)
+    DIM = 4
+    DTYPE = np.complex128
+
+    # Base linear system (invertible) and target x*
+    A = np.array(
+        [[1.5, 0.5j, 0, 0],
+         [-0.5j, 1.2, 0, 0],
+         [0, 0, 1, 0],
+         [0, 0, 0, 1]], dtype=DTYPE
+    )
+    b = np.array([1.0, -0.5, 0, 0], dtype=DTYPE)
+    x_star = np.linalg.solve(A, b)
+
+    # Base operator: gradient (potential) or skew-rotated (non-potential)
+    if use_non_potential_op:
+        S = np.array([[0, -1, 0, 0],
+                      [1,  0, 0, 0],
+                      [0,  0, 0,-1],
+                      [0,  0, 1, 0]])
+        base_op_fn_raw = lambda v: S @ (A @ v - b)
+    else:
+        base_op_fn_raw = lambda v: A @ v - b
+
+    base_op_fn = lambda v: (base_op_fn_raw(v), {'oracle_calls': 1})
+    base_cert = CertRec("BaseOp", L=np.linalg.norm(A, 2))
+    base_cert.theta_kl = 0.5  # KL error bound hook used for step sizing
+
+    # Quadratic objective for potential-mode diagnostics & trust-region
+    problem_J = lambda v: 0.5 * np.linalg.norm(v - x_star) ** 2
+    grad_J    = lambda v: v - x_star
+    hess_J    = np.eye(DIM, dtype=DTYPE)
+
+    # Initial system state
+    psi0 = (rng.get_stream().standard_normal(DIM)
+            + 1j * rng.get_stream().standard_normal(DIM))
+    psi0 = psi0 / (np.linalg.norm(psi0) + 1e-12)
+    system_state = {
+        'psi': psi0.copy(),
+        'Q': np.eye(DIM, dtype=DTYPE) * 0.1,
+        'E': np.zeros((DIM, DIM), dtype=DTYPE),
+        'M': np.zeros((DIM, DIM), dtype=DTYPE),
+    }
+
+    D_diss = 0.01  # small dissipation constant
+    param_adapter = {
+        'Q_coupling': ProbabilisticParameter('Q_coupling'),
+        'E_coupling': ProbabilisticParameter('E_coupling')
+    }
+
+    # Modules & infra
+    logger = EKLogger()
+    modules = build_placeholder_modules(rng, base_op_fn, base_cert, DIM, DTYPE)
+    module_map = {m.name: m for m in modules}
     vr_oracle = next((m for m in modules if isinstance(m, VarianceReducedOracle)), None)
     group_adapter = next((m for m in modules if isinstance(m, GroupRobustnessAdapter)), None)
+
     if vr_oracle:
-        vr_oracle.op_fn = lambda x,i: (base_op_fn_raw(x) + rng.get_stream().normal(0,0.05,DIM), {})
+        vr_oracle.op_fn = lambda x, i: (base_op_fn_raw(x) + rng.get_stream().normal(0, 0.05, DIM), {})
         vr_oracle.full_update(system_state['psi'])
 
-    inv = Invariants(enforce_unit_norm=True); controller = AdaptiveController(ControllerConfig(), SafetyProjector(inv, dim=DIM, dtype=DTYPE))
-    meta_adapter = MetaAdaptationModule(None, controller); scheduler = HierarchicalScheduler(budget_B=5.0, meta_adapter=meta_adapter)
-    meta_adapter.scheduler = scheduler; conf_monitor = ConformalMonitor(alpha=0.1); consciousness_suite = ConsciousnessMetricSuite()
-    psi_prev, eta_prev, psi_history, safe_set_h_history = system_state['psi'].copy(), 1.0, [system_state['psi'].copy()], [None]
-    k_last_update, delta_min_k, trigger_delta, epoch_len, consecutive_failures, tr_state = 0, 2, 0.05, 10, 0, TrustRegionState()
+    inv = Invariants(enforce_unit_norm=True)
+    controller = AdaptiveController(ControllerConfig(), SafetyProjector(inv, dim=DIM, dtype=DTYPE))
+    meta_adapter = MetaAdaptationModule(None, controller)
+    scheduler = HierarchicalScheduler(budget_B=5.0, meta_adapter=meta_adapter)
+    meta_adapter.scheduler = scheduler
+    conf_monitor = ConformalMonitor(alpha=0.1)
+    consciousness_suite = ConsciousnessMetricSuite()
+
+    psi_prev = system_state['psi'].copy()
+    eta_prev = 1.0
+    psi_dot  = np.zeros(DIM, dtype=DTYPE)
+    psi_history = [system_state['psi'].copy()]
+    safe_set_h_history = [None]
+
+    k_last_update = 0
+    delta_min_k = 2
+    trigger_delta = 0.05
+    epoch_len = 10
+    consecutive_failures = 0
+    tr_state = TrustRegionState()
+
     prev_entropies = {comp: shannon_entropy_matrix(system_state[comp]) for comp in ['Q', 'E', 'M']}
 
-    def problem_T(current_system_state: Dict, T_kwargs: Dict) -> Tuple[np.ndarray, Dict]:
-        # ** FRAMEWORK CORRECTION **: This function is refactored for the sequential
-        # T(x) = BaseOp(Pipeline(x)) model, compliant with the framework specification.
-        x = current_system_state['psi']; total_aux = {}
+    # Shared kwargs (adapter_info is a shared dict mutated by adapters)
+    op_kwargs = {
+        "adapter_info": {},
+        "psi_history": psi_history,
+        "active_modules": [],
+        "sample_idx": 0,
+        "base_op_func": base_op_fn,
+        "vr_oracle": vr_oracle,
+        "Q_coupling": 0.0,
+        "E_coupling": 0.0,
+    }
+
+    def problem_T(current_system_state: Dict[str, Any], T_kwargs: Dict[str, Any]) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """
+        Sequential cognitive pipeline followed by base operator:
+            y = Pipeline(x)   (ordered by CANONICAL_COGNITIVE_PIPELINE_ORDER)
+            T(x) = Base(y)
+        Returns (T(x), aux).
+        """
+        x = current_system_state['psi']
+        total_aux: Dict[str, Any] = {}
         active_mods = T_kwargs["active_modules"]
+
+        # Shallow copy; nested dicts (like adapter_info) are shared by reference.
         module_kwargs = {**T_kwargs, **current_system_state}
-        
-        # 1. Evaluate the cognitive pipeline sequentially to get the pre-conditioned state `y`.
+
+        # 1) Cognitive pipeline in canonical order
         y = x.copy()
+
         def _matches_stage(mod, p):
             n = mod.name
-            # exact, prefix, suffix from adapters like DP_N, GroupRobust_A, TimeHist_R, etc.
             return (n == p) or n.startswith(p) or n.endswith(f"_{p}") or n.startswith(f"{p}_")
 
-        cognitive_pipeline_map = {
+        stage_map = {
             p: next((m for m in active_mods if _matches_stage(m, p)), None)
             for p in CANONICAL_COGNITIVE_PIPELINE_ORDER
         }
+
         for prefix in CANONICAL_COGNITIVE_PIPELINE_ORDER:
-            module = cognitive_pipeline_map.get(prefix)
+            module = stage_map.get(prefix)
             if module:
                 y, aux = module.apply(y, **module_kwargs)
-                total_aux.update(aux)
-        
-        # 2. Apply the base problem operator to the transformed state `y`.
+                if isinstance(aux, dict):
+                    total_aux.update(aux)
+
+        # 2) Base operator on transformed state
         base_module = module_map.get("Base")
         if base_module:
             T_final, aux_base = base_module.apply(y, **module_kwargs)
-            total_aux.update(aux_base)
+            if isinstance(aux_base, dict):
+                total_aux.update(aux_base)
         else:
-            T_final, aux_base = np.zeros_like(x), {}
-            
+            T_final = np.zeros_like(x)
         return T_final, total_aux
 
     for k in range(max_iter):
-        Q_coupling_k, E_coupling_k = param_adapter['Q_coupling'].get_mean(), param_adapter['E_coupling'].get_mean()
+        # Update finite-difference "velocity" and lightweight event trigger
         psi = system_state['psi']
+        psi_dot = (psi - psi_prev) / (eta_prev + 1e-12)
+
         should_update = (
-            (k - k_last_update) >= delta_min_k
-            and (np.linalg.norm(psi - psi_history[-1]) >
-                 trigger_delta * (np.linalg.norm(psi_history[-1]) + 1e-9))
+            (k - k_last_update) >= delta_min_k and
+            (np.linalg.norm(psi - psi_history[-1]) >
+             trigger_delta * (np.linalg.norm(psi_history[-1]) + 1e-9))
         )
         if should_update:
             k_last_update = k
-            
-        delta_J = problem_J(psi) - problem_J(psi_prev); true_collapse = breakthrough_indicator(delta_J, threshold=0.05) > 0
 
-        base_metrics = {"stagnation": stagnation_indicator(psi-psi_prev, 0.01), "true_collapse": true_collapse,
-                        "performance": performance_metric(grad_J(psi), psi_dot), "safety_margin": safety_margin(psi, inv),
-                        "hausdorff_drift": hausdorff_drift(inv.h, safe_set_h_history[-1], inv.G)}
+        # Adapter parameters (Bayesian means)
+        Q_coupling_k = param_adapter['Q_coupling'].get_mean()
+        E_coupling_k = param_adapter['E_coupling'].get_mean()
+
+        # Performance deltas & base metrics
+        delta_J = problem_J(psi) - problem_J(psi_prev)
+        true_collapse = breakthrough_indicator(delta_J, threshold=0.05) > 0  # "large uphill" event
+
+        base_metrics = {
+            "stagnation": stagnation_indicator(psi - psi_prev, 0.01),
+            "true_collapse": true_collapse,
+            "performance": performance_metric(grad_J(psi), psi_dot),
+            "safety_margin": safety_margin(psi, inv),
+            "hausdorff_drift": hausdorff_drift(inv.h, safe_set_h_history[-1], inv.G),
+        }
         base_metrics["sigma"] = controller.cfg.sigma
         base_metrics.update(consciousness_indicators(consciousness_suite, system_state, base_metrics, meta_adapter.consciousness_alphas))
-        
-        active_modules = scheduler.select(modules, base_metrics)
-        if not active_modules: print(f"Step {k}: No modules. Stopping."); break
 
-        op_kwargs.update({"psi_history": psi_history, "active_modules": active_modules, "sample_idx": k % epoch_len,
-                          "base_op_func": base_op_fn, "vr_oracle": vr_oracle, "Q_coupling": Q_coupling_k, "E_coupling": E_coupling_k})
+        # Module selection under budget
+        active_modules = scheduler.select(modules, base_metrics)
+        if not active_modules:
+            print(f"Step {k}: No modules. Stopping.")
+            break
+
+        # Update op kwargs (keep adapter_info object identity!)
+        op_kwargs["psi_history"] = psi_history
+        op_kwargs["active_modules"] = active_modules
+        op_kwargs["sample_idx"] = k % epoch_len
+        op_kwargs["base_op_func"] = base_op_fn
+        op_kwargs["vr_oracle"] = vr_oracle
+        op_kwargs["Q_coupling"] = Q_coupling_k
+        op_kwargs["E_coupling"] = E_coupling_k
+
+        # T function on-the-fly for line search & certificates
         T_func = lambda v: problem_T({**system_state, 'psi': v}, op_kwargs)[0]
-        
-        # ** FRAMEWORK CORRECTION **: Compose all certificates sequentially.
-        active_certs_in_order = [m.contract().cert for p in CANONICAL_COGNITIVE_PIPELINE_ORDER for m in active_modules if m.name.startswith(p)]
-        all_certs_for_composition = active_certs_in_order + [base_cert]
-        cert_T = compose_certs_safely(all_certs_for_composition, "sequential")
+
+        # Compose certificates (sequential)
+        active_certs_in_order = [
+            m.contract().cert
+            for p in CANONICAL_COGNITIVE_PIPELINE_ORDER
+            for m in active_modules if m.name.startswith(p)
+        ]
+        cert_T = compose_certs_safely(active_certs_in_order + [base_cert], "sequential")
         cert_T.proof_sketch += " | Full Sequential Composition."
 
-        if consecutive_failures > 3: cert_T, _ = falsify_certificate_by_sampling(T_func, cert_T, rng, DIM)
-        
+        # Empirical certificate tightening after repeated failures
+        if consecutive_failures > 3:
+            cert_T, _ = falsify_certificate_by_sampling(T_func, cert_T, rng, DIM)
+
+        # --- KEY FIX: decide merit mode based on whether the pipeline is active ---
+        pipeline_active = any(m.name != "Base" for m in active_modules)
+        non_potential_mode_flag = use_non_potential_op or pipeline_active
+
+        # Take a step
         if use_trust_region:
-            psi_new, tr_state, accepted = controller.trust_region_step(psi, problem_J, grad_J, hess_J, tr_state); eta = tr_state.delta
-        else: psi_new, eta, accepted = controller.step(psi, T_func, problem_J, cert_T, grad_J, use_non_potential_op, x_star)
-        
-        step_rejected = not accepted; nonconformity = np.linalg.norm(psi_new - psi) / (eta + 1e-9)
-        if not conf_monitor.check(nonconformity): step_rejected = True
-        if not step_rejected: conf_monitor.add_score(nonconformity); consecutive_failures = 0
-        else: print(f"Step {k}: Rejected. |psi|={np.linalg.norm(psi):.4f}"); consecutive_failures += 1
-        
+            psi_new, tr_state, accepted = controller.trust_region_step(psi, problem_J, grad_J, hess_J, tr_state)
+            eta = tr_state.delta
+        else:
+            psi_new, eta, accepted = controller.step(
+                psi, T_func, problem_J, cert_T, grad_J,
+                non_potential_mode=non_potential_mode_flag,
+                x_star=x_star
+            )
+
+        # Conformal rejection gate
+        step_rejected = not accepted
+        nonconformity = np.linalg.norm(psi_new - psi) / (eta + 1e-12)
+        if not conf_monitor.check(nonconformity):
+            step_rejected = True
+
+        if not step_rejected:
+            conf_monitor.add_score(nonconformity)
+            consecutive_failures = 0
+        else:
+            print(f"Step {k}: Rejected. |psi|={np.linalg.norm(psi):.4f}")
+            consecutive_failures += 1
+
+        # Evaluate operator at current state for logging/aux
         Tx, T_aux = problem_T(system_state, op_kwargs)
-        metrics = {**base_metrics, "accepted": not step_rejected, "eta": eta, "restarted": False,
-                   "step_rejected": step_rejected, "update_step": psi_new - psi, "operator_val": Tx,
-                   "th_weights": op_kwargs["adapter_info"].get('th_weights'), "consecutive_failures": consecutive_failures}
-        if k>0 and not step_rejected and AdaptiveController.monotone_restart_check(psi_new,psi,psi_prev): metrics["restarted"]=True
-        
-        if metrics['f'] > 0.5: modules, new_map = meta_adapter.adapt(metrics, modules); new_map and module_map.update(new_map)
-        
-        H_psi_before, H_psi_after = shannon_entropy_vector(psi), shannon_entropy_vector(psi)
+
+        # Metrics packet
+        th_weights = op_kwargs["adapter_info"].get('th_weights')
+        metrics = {
+            **base_metrics,
+            "accepted": not step_rejected,
+            "eta": eta,
+            "restarted": False,
+            "step_rejected": step_rejected,
+            "update_step": psi_new - psi,
+            "operator_val": Tx,
+            "th_weights": th_weights,
+            "consecutive_failures": consecutive_failures,
+        }
+        if k > 0 and not step_rejected and AdaptiveController.monotone_restart_check(psi_new, psi, psi_prev):
+            metrics["restarted"] = True
+
+        # Meta-adaptation (can swap modules)
+        if metrics['f'] > 0.5:
+            modules, new_map = meta_adapter.adapt(metrics, modules)
+            if new_map:
+                module_map.update(new_map)
+
+        # Entropy bookkeeping
+        H_psi_before = shannon_entropy_vector(psi)
+        H_psi_after = H_psi_before
+
         if not step_rejected:
             system_state['psi'] = psi_new
+
+            # "Collapse" pruning (paper’s sparsification heuristic)
             if true_collapse:
-                thresh = 0.1 * np.max(np.abs(psi_new)); system_state['psi'][np.abs(psi_new) < thresh] = 0
-                system_state['psi'] /= np.linalg.norm(system_state['psi'])
-                H_psi_after = shannon_entropy_vector(system_state['psi']); delta_H_psi = H_psi_after - H_psi_before
+                thresh = 0.1 * np.max(np.abs(psi_new))
+                mask = np.abs(system_state['psi']) >= thresh
+                if mask.any():
+                    system_state['psi'][~mask] = 0
+                norm_psi = np.linalg.norm(system_state['psi'])
+                if norm_psi > 1e-12:
+                    system_state['psi'] /= norm_psi
+
+                H_psi_after = shannon_entropy_vector(system_state['psi'])
+                delta_H_psi = H_psi_after - H_psi_before
                 if delta_H_psi < 0:
-                    conserved_info = (1.0 - D_diss) * (-delta_H_psi); change_tensor = np.outer(metrics['update_step'].conj(), metrics['update_step']); norm_ct = np.trace(change_tensor).real
+                    v = metrics['update_step']
+                    change_tensor = np.outer(v.conj(), v)
+                    norm_ct = np.trace(change_tensor).real
                     if norm_ct > 1e-12:
-                        norm_change = change_tensor / norm_ct; norm_Q, norm_E, norm_M = np.linalg.norm(system_state['Q']), np.linalg.norm(system_state['E']), np.linalg.norm(system_state['M'])
+                        norm_change = change_tensor / norm_ct
+                        norm_Q = np.linalg.norm(system_state['Q'])
+                        norm_E = np.linalg.norm(system_state['E'])
+                        norm_M = np.linalg.norm(system_state['M'])
                         total_norm = norm_Q + norm_E + norm_M + 1e-12
+                        conserved_info = (1.0 - D_diss) * (-delta_H_psi)
                         system_state['Q'] += norm_change * conserved_info * (norm_Q / total_norm)
                         system_state['E'] += norm_change * conserved_info * (norm_E / total_norm)
                         system_state['M'] += norm_change * conserved_info * (norm_M / total_norm)
-            else: H_psi_after = shannon_entropy_vector(system_state['psi'])
-            
-            perf = metrics['performance']; param_adapter['Q_coupling'].update(max(0,perf-0.5)*2, max(0,0.5-perf)*2); param_adapter['E_coupling'].update(max(0,perf-0.5)*2, max(0,0.5-perf)*2)
-            if group_adapter and group_adapter in active_modules:
-                group_losses = np.array([-performance_metric(grad_J(gx), go) for gx, go in zip(T_aux['group_x'], T_aux['group_ops'])])
+            else:
+                H_psi_after = shannon_entropy_vector(system_state['psi'])
+
+            # Online parameter updates
+            perf = metrics['performance']
+            param_adapter['Q_coupling'].update(max(0, perf - 0.5) * 2, max(0, 0.5 - perf) * 2)
+            param_adapter['E_coupling'].update(max(0, perf - 0.5) * 2, max(0, 0.5 - perf) * 2)
+
+            # Group-robust adapter (if active)
+            if group_adapter and group_adapter in active_modules and 'group_x' in T_aux and 'group_ops' in T_aux:
+                group_losses = np.array([
+                    -performance_metric(grad_J(gx), go) for gx, go in zip(T_aux['group_x'], T_aux['group_ops'])
+                ])
                 metrics['equity_gap'] = equity_gap(group_losses.tolist())
                 group_adapter.update_weights(group_losses)
-        
-        p_plan = metrics.get('th_weights', np.array([1.0]))
+
+        # Plan/actual audit divergence (size-safe)
         ud = metrics['update_step']
-        denom = float(np.sum(np.abs(ud)**2))
+        denom = float(np.sum(np.abs(ud) ** 2))
         if denom > 1e-12:
-            p_actual = (np.abs(ud)**2) / denom
+            p_actual = (np.abs(ud) ** 2) / denom
         else:
             p_actual = np.ones_like(ud, dtype=float) / ud.size
-        if len(p_plan) == len(p_actual): metrics['audit_divergence'] = audit_divergence(p_plan, p_actual)
 
-        rates = meta_adapter.cognitive_rates; system_state['Q'] *= rates['q_decay']; system_state['E'] *= rates['e_decay']; system_state['M'] *= rates['m_decay']
+        p_plan = metrics.get('th_weights', None)
+        if p_plan is not None:
+            p_plan = np.asarray(p_plan, dtype=float)
+            if p_plan.size != p_actual.size:
+                p_plan = np.ones_like(p_actual) / p_actual.size
+            else:
+                p_plan = p_plan / (p_plan.sum() + 1e-12)
+            metrics['audit_divergence'] = audit_divergence(p_plan, p_actual)
+
+        # Tensor decay/accumulation (information balance controller)
+        rates = meta_adapter.cognitive_rates
+        system_state['Q'] *= rates['q_decay']
+        system_state['E'] *= rates['e_decay']
+        system_state['M'] *= rates['m_decay']
+
         v = metrics['update_step']
         change_tensor = np.outer(v, v.conj())
+        norm_ct = np.trace(change_tensor).real
         if norm_ct > 1e-12:
             norm_change = change_tensor / norm_ct
-            system_state['Q'] += norm_change * np.linalg.norm(metrics['update_step']) * rates['q_accum_rate']
+            mag = np.linalg.norm(v)
+            system_state['Q'] += norm_change * mag * rates['q_accum_rate']
             system_state['E'] += norm_change * (metrics['performance'] - 0.5) * rates['e_accum_rate']
-            system_state['M'] += norm_change * np.linalg.norm(metrics['update_step']) * rates['m_accum_rate']
+            system_state['M'] += norm_change * mag * rates['m_accum_rate']
 
-        # FRAMEWORK COMPLIANCE NOTE (Information Conservation Law, Sec 3.7):
-        # This section implements the Information Conservation Law as a feedback
-        # controller. Instead of assuming the law emerges naturally from the complex
-        # numerical dynamics (which is practically infeasible), this code re-frames the
-        # principle as a control objective to be actively enforced. The `info_balance_deviation`
-        # serves as an error signal, and the `correction_factor` is the control action
-        # that steers the system back towards satisfying the conservation principle. This
-        # is a deliberate and robust engineering choice for implementing the abstract law.
         current_entropies = {comp: shannon_entropy_matrix(system_state[comp]) for comp in ['Q', 'E', 'M']}
-        d_H_dt = {comp: (current_entropies[comp]-prev_entropies[comp])/(eta+1e-12) for comp in ['Q','E','M']}
+        d_H_dt = {comp: (current_entropies[comp] - prev_entropies[comp]) / (eta + 1e-12) for comp in ['Q', 'E', 'M']}
         d_H_total_dt = sum(d_H_dt.values())
         metrics['H_psi_change'] = H_psi_after - H_psi_before
         metrics['info_balance_deviation'] = d_H_total_dt + D_diss
+
         info_deviation = metrics['info_balance_deviation']
-        if abs(info_deviation) > 0.05: # Error threshold
+        if abs(info_deviation) > 0.05:
             correction_factor = 1.0 - np.clip(info_deviation * 0.1, -0.1, 0.1)
             system_state['Q'] *= correction_factor
             system_state['E'] *= correction_factor
@@ -1398,17 +1585,34 @@ def echokey_main_loop_skeleton(max_iter=30, use_non_potential_op=False, use_trus
             metrics['info_conservation_correction_factor'] = correction_factor
 
         prev_entropies = current_entropies
-        
         metrics.update(consciousness_indicators(consciousness_suite, system_state, metrics, meta_adapter.consciousness_alphas))
-        if step_rejected: continue
-        
-        comp_info = {"total_cost": sum(m.cost() for m in active_modules), "active_modules": [m.name for m in active_modules], "oracle_calls": T_aux.get('oracle_calls', 0)}
-        log_rec=logger.log_step(k,system_state,eta,cert_T,inv,metrics,rng.seed,comp_info); rng.advance(log_rec)
-        psi_prev, eta_prev = psi, eta; psi_history.append(system_state['psi'].copy()); psi_history=psi_history[-20:]
+
+        if step_rejected:
+            continue
+
+        # Structured log & provenance
+        comp_info = {
+            "total_cost": sum(m.cost() for m in active_modules),
+            "active_modules": [m.name for m in active_modules],
+            "oracle_calls": T_aux.get('oracle_calls', 0) if isinstance(T_aux, dict) else 0
+        }
+        log_rec = logger.log_step(k, system_state, eta, cert_T, inv, metrics, rng.seed, comp_info)
+        rng.advance(log_rec)
+
+        # Roll forward loop state
+        psi_prev, eta_prev = psi, eta
+        psi_history.append(system_state['psi'].copy())
+        psi_history[:] = psi_history[-20:]
         safe_set_h_history.append(inv.h.copy() if inv.h is not None else None)
-        print(f"Step {k}: Accepted. J(x)={problem_J(system_state['psi']):.4f}, eta={eta:.4f}, |T(x)|={np.linalg.norm(Tx):.4f}, C_total={metrics['c_total']:.3f}")
-        if vr_oracle and vr_oracle in active_modules and (k+1)%epoch_len==0:
-            vr_comp = vr_oracle.full_update(system_state['psi']); comp_info['oracle_calls'] += vr_comp.get('oracle_calls', 0)
+
+        print(f"Step {k}: Accepted. J(x)={problem_J(system_state['psi']):.4f}, "
+              f"eta={eta:.4f}, |T(x)|={np.linalg.norm(Tx):.4f}, C_total={metrics['c_total']:.3f}")
+
+        # Periodic full-table refresh for VR oracle
+        if vr_oracle and vr_oracle in active_modules and (k + 1) % epoch_len == 0:
+            vr_comp = vr_oracle.full_update(system_state['psi'])
+            comp_info['oracle_calls'] += vr_comp.get('oracle_calls', 0)
+
     print("--- Skeleton Loop Finished ---\n")
 
 def echokey_splitting_demo(max_iter=50):
